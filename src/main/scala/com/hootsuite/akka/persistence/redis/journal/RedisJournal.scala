@@ -30,26 +30,27 @@ class RedisJournal extends AsyncWriteJournal with ActorLogging with DefaultRedis
   override def asyncWriteMessages(messages: Seq[AtomicWrite]): Future[Seq[Try[Unit]]] = {
     import Journal._
 
-    val transactionFutures: Seq[Future[Unit]] = messages.map { a =>
-      val transaction = redis.transaction()
+    val result: Seq[Future[Try[Unit]]] =
+      messages.map { a ⇒
+        val transaction = redis.transaction()
 
-      a.payload.map { pr =>
-        toBytes(pr) match {
-          case Success(serialized) =>
-            val journal = Journal(pr.sequenceNr, serialized, pr.deleted)
-            transaction.zadd(journalKey(pr.persistenceId), (pr.sequenceNr, journal))
-            transaction.set(highestSequenceNrKey(pr.persistenceId), pr.sequenceNr)
-          case Failure(e) => Future.failed(throw new scala.RuntimeException("writeMessages: failed to write PersistentRepr to redis"))
+        // TODO : I think the problem is the result of this map is lost only the result of the transaction.exec() call is used
+        a.payload.map { pr =>
+          toBytes(pr) match {
+            case Success(serialized) =>
+              val journal = Journal(pr.sequenceNr, serialized, pr.deleted)
+              transaction.zadd(journalKey(pr.persistenceId), (pr.sequenceNr, journal))
+              transaction.set(highestSequenceNrKey(pr.persistenceId), pr.sequenceNr)
+            case Failure(e) => Future.failed(throw new scala.RuntimeException("writeMessages: failed to write PersistentRepr to redis"))
+          }
         }
+
+        val promise = Promise[Try[Unit]]()
+        transaction.exec().map(_ => ()).onComplete(promise.success)
+        promise.future
       }
 
-      transaction.exec().map(_ => ())
-    }
-    Future.traverse(transactionFutures) { future =>
-      val promise = Promise[Try[Unit]]()
-      future.onComplete(promise.success)
-      promise.future
-    }
+    Future.sequence(result)
   }
 
   /**
