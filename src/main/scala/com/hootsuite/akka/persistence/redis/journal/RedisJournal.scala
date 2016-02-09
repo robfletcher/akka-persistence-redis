@@ -30,21 +30,22 @@ class RedisJournal extends AsyncWriteJournal with ActorLogging with DefaultRedis
   private def highestSequenceNrKey(persistenceId: String) = s"${journalKey(persistenceId)}.highestSequenceNr"
 
   override def asyncWriteMessages(messages: Seq[AtomicWrite]): Future[Seq[Try[Unit]]] = {
-    val result: Seq[Future[Try[Unit]]] = messages.map(asyncAtomicWrite)
-    Future.sequence(result)
+    Future.sequence(messages.map(asyncWriteBatch))
   }
 
-  def asyncAtomicWrite(a: AtomicWrite): Future[Try[Unit]] = {
+  private def asyncWriteBatch(a: AtomicWrite): Future[Try[Unit]] = {
     val transaction = redis.transaction()
 
-    a.payload.map(writeOperation(transaction, _))
+    val eventualUnit: Future[Unit] = Future.sequence(a.payload.map(asyncWriteOperation(transaction, _))).map(_ => ())
 
-    val promise = Promise[Try[Unit]]()
-    transaction.exec().map(_ => ()).onComplete(promise.success)
-    promise.future
+    transaction.exec()
+
+    eventualUnit.map(Success(_)).recover {
+      case ex => Failure(ex)
+    }
   }
 
-  def writeOperation(transaction: TransactionBuilder, pr: PersistentRepr): Future[Unit] = {
+  private def asyncWriteOperation(transaction: TransactionBuilder, pr: PersistentRepr): Future[Unit] = {
     import Journal._
 
     toBytes(pr) match {
