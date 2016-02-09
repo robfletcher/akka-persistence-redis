@@ -6,6 +6,8 @@ import akka.persistence.journal.AsyncWriteJournal
 import com.hootsuite.akka.persistence.redis.{ByteArraySerializer, DefaultRedisComponent}
 import redis.ByteStringSerializer.LongConverter
 import redis.api.Limit
+import redis.commands.TransactionBuilder
+import redis.protocol.MultiBulk
 
 import scala.collection.immutable.Seq
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -28,29 +30,31 @@ class RedisJournal extends AsyncWriteJournal with ActorLogging with DefaultRedis
   private def highestSequenceNrKey(persistenceId: String) = s"${journalKey(persistenceId)}.highestSequenceNr"
 
   override def asyncWriteMessages(messages: Seq[AtomicWrite]): Future[Seq[Try[Unit]]] = {
+    val result: Seq[Future[Try[Unit]]] = messages.map(asyncAtomicWrite)
+    Future.sequence(result)
+  }
+
+  def asyncAtomicWrite(a: AtomicWrite): Future[Try[Unit]] = {
+    val transaction = redis.transaction()
+
+    a.payload.map(writeOperation(transaction, _))
+
+    val promise = Promise[Try[Unit]]()
+    transaction.exec().map(_ => ()).onComplete(promise.success)
+    promise.future
+  }
+
+  def writeOperation(transaction: TransactionBuilder, pr: PersistentRepr): Future[Unit] = {
     import Journal._
 
-    val result: Seq[Future[Try[Unit]]] =
-      messages.map { a ⇒
-        val transaction = redis.transaction()
-
-        // TODO : I think the problem is the result of this map is lost only the result of the transaction.exec() call is used
-        a.payload.map { pr =>
-          toBytes(pr) match {
-            case Success(serialized) =>
-              val journal = Journal(pr.sequenceNr, serialized, pr.deleted)
-              transaction.zadd(journalKey(pr.persistenceId), (pr.sequenceNr, journal))
-              transaction.set(highestSequenceNrKey(pr.persistenceId), pr.sequenceNr)
-            case Failure(e) => Future.failed(throw new scala.RuntimeException("writeMessages: failed to write PersistentRepr to redis"))
-          }
-        }
-
-        val promise = Promise[Try[Unit]]()
-        transaction.exec().map(_ => ()).onComplete(promise.success)
-        promise.future
-      }
-
-    Future.sequence(result)
+    toBytes(pr) match {
+      case Success(serialized) =>
+        val journal = Journal(pr.sequenceNr, serialized, pr.deleted)
+        transaction.zadd(journalKey(pr.persistenceId), (pr.sequenceNr, journal)).zip(
+          transaction.set(highestSequenceNrKey(pr.persistenceId), pr.sequenceNr)
+        ).map(_ => ())
+      case Failure(e) => Future.failed(new scala.RuntimeException("writeMessages: failed to write PersistentRepr to redis"))
+    }
   }
 
   /**
